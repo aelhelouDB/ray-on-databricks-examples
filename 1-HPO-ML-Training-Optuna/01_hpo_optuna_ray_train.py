@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # HPO 
 # MAGIC
-# MAGIC In this demo we'll cover the new recommended ways for performing distributed hyperparameter optimization on databricks, while also leveraging MLflow for tracking experiments and the feature engineering client to ensure lineage between models and feature tables.
+# MAGIC In this example we'll cover the new recommended ways for performing distributed hyperparameter optimization on databricks, while also leveraging MLflow for tracking experiments and the feature engineering client to ensure lineage between models and feature tables.
 # MAGIC
 # MAGIC We'll cover 2 approaches (based on dataset size, training time/model complexity, hardware availability and auto-scaling needs):
 # MAGIC
@@ -13,10 +13,20 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -U optuna optuna-integration mlflow
+# MAGIC %pip install -qU databricks-feature-engineering optuna optuna-integration mlflow
 # MAGIC
 # MAGIC
 # MAGIC dbutils.library.restartPython()
+
+# COMMAND ----------
+
+catalog = "amine_elhelou" # Change This
+schema = "ray_gtm_examples"
+table = "adult_synthetic_raw"
+feature_table_name = "features_synthetic"
+labels_table_name = "labels_synthetic"
+label="income"
+primary_key = "id"
 
 # COMMAND ----------
 
@@ -30,29 +40,14 @@
 
 # COMMAND ----------
 
-# Read synthetic dataset and write as feature and labels tables 
+# DBTITLE 1,Read synthetic dataset and write as feature and labels tables
 from databricks.feature_engineering import FeatureEngineeringClient
 
 
 fe = FeatureEngineeringClient()
-catalog = dbutils.widgets.get("catalog")
-print(f"Catalog: {catalog}")
-if catalog is None or catalog == '':
-  print(f"Catalog not set, using default catalog: {default_catalog_name}")
-  catalog = default_catalog_name
-schema = "tko_fy25_hpo"
-feature_table_name = "features"
-labels_table_name = "labels"
-label="income"
-primary_key = "id"
-# dataset_location = "/Volumes/amine_elhelou/tko_fy25_hpo/synthetic-dataset/adult_census_synthetic_tko.snappy.parquet"
-dataset_location = "https://s3.us-west-2.amazonaws.com/files.training.databricks.com/techsummit/TraditionalDSML-MLOps/adult_census_synthetic_tko.snappy.parquet"
-
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
 
 # Read dataset and remove duplicate keys
-adult_synthetic_df = spark.createDataFrame(pd.read_parquet(dataset_location)).dropDuplicates([primary_key])
+adult_synthetic_df = spark.read.table(f"{catalog}.{schema}.{table}").dropDuplicates([primary_key])
 
 # Do this ONCE
 try:
@@ -141,7 +136,7 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Ser
   cat_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='most_frequent')),("one_hot_encoder", OneHotEncoder(handle_unknown="ignore"))])
   num_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='median'))])                        
 
-  preprocessor = (
+  preprocessor = ColumnTransformer(
     [
       ("cat", cat_pipeline, categorical_cols),
       ("num", num_pipeline, numerical_cols)
@@ -388,25 +383,12 @@ def optuna_hpo_fn(n_trials: int, features: pd.DataFrame, labels: pd.Series, mode
         # Fit best model and log using FE client in parent run
         model_pipeline = Pipeline(steps=[("preprocessor", objective_fn.preprocessor), ("classifier", best_model)])
         model_pipeline.fit(X_train, Y_train)
-
-        # Infer signature
-        input_example = X_train.iloc[:1]
-
-        # Infer output schema
-        try:
-            output_schema = _infer_schema(Y_train)
-        
-        except Exception as e:
-            warnings.warn(f"Could not infer model output schema: {e}")
-            output_schema = None
         
         fe.log_model(
             model=model_pipeline,
             artifact_path="model",
             flavor=mlflow.sklearn,
             training_set=training_set,
-            input_example=input_example,
-            output_schema=output_schema,
             registered_model_name=model_name
         )
 
@@ -649,6 +631,7 @@ def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
 # MAGIC
 # MAGIC * pick and configure `Optuna` from [ray.tune.search](https://docs.ray.io/en/latest/tune/api/suggestion.html)
 # MAGIC * use the [ConcurrencyLimiter](https://docs.ray.io/en/latest/tune/api/doc/ray.tune.search.ConcurrencyLimiter.html#ray.tune.search.ConcurrencyLimiter) to limit number of concurrent trials
+# MAGIC * **TO-DO:** Update mlflow callbacks section
 
 # COMMAND ----------
 

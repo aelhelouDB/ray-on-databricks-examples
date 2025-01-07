@@ -6,12 +6,8 @@
 
 # COMMAND ----------
 
-catalog = "amine_elhelou" # "mlops_pj" Change This
-schema = "tko_fy25_hpo"
-feature_table_name = "features_synthetic"
-labels_table_name = "labels_synthetic"
-label="income"
-primary_key = "id"
+catalog = "amine_elhelou" # Change This
+schema = "ray_gtm_examples"
 
 spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
@@ -54,6 +50,10 @@ clean_df = clean_df.na.replace("?", None)
 
 # COMMAND ----------
 
+clean_df.groupBy("income").count().display()
+
+# COMMAND ----------
+
 import dbldatagen as dg
 
 
@@ -66,17 +66,28 @@ clean_df.summary().display()
 
 # COMMAND ----------
 
-unique_occupations = clean_df.select("native_country").distinct().collect()
-country_list = [row.native_country for row in unique_occupations]
+unique_occupations = clean_df.select("occupation").dropna().distinct().collect()
+occupation_list = [row.occupation for row in unique_occupations]
+
+unique_relations = clean_df.select("relationship").dropna().distinct().collect()
+relation_list = [row.relationship for row in unique_relations]
+
+unique_races = clean_df.select("race").distinct().dropna().collect()
+race_list = [row.race for row in unique_races]
+
+unique_genders = clean_df.select("sex").distinct().dropna().collect()
+gender_list = [row.sex for row in unique_genders]
+
+unique_countries = clean_df.select("native_country").dropna().distinct().collect()
+country_list = [row.native_country for row in unique_countries]
 
 # COMMAND ----------
 
-# Column definitions are stubs only - modify to generate correct data  
-#
+n_rows = 123000
 generation_spec = (
     dg.DataGenerator(sparkSession=spark, 
                      name='synthetic_data', 
-                     rows=100000,
+                     rows=n_rows,
                      random=True,
                      )
     .withColumn('age', 'double', minValue=17, maxValue=95, step=1)
@@ -93,7 +104,7 @@ generation_spec = (
     .withColumn('capital_loss', 'double', minValue=0.0, maxValue=5000, step=100)
     .withColumn('hours_per_week', 'double', minValue=1.0, maxValue=100.0, step=1)
     .withColumn('native_country', 'string', values=country_list)
-    .withColumn('income', 'string', values=['<=50K', '>50K'])
+    .withColumn('income', 'string', values=['<=50K', '>50K'], weights=[0.75, 0.25])
     )
 
 # COMMAND ----------
@@ -104,17 +115,13 @@ df_synthetic_data = generation_spec.build()
 
 from pyspark.sql import functions as F
 
-df_synthetic_data = df_synthetic_data \
-  .withColumn("id", F.expr("uuid()")) \
-  .selectExpr("id", "* EXCEPT (id)")
+
+df_synthetic_data_with_id = df_synthetic_data \
+  .withColumn("id", F.expr("uuid()"))
 
 # COMMAND ----------
 
-# df_synthetic_data = fe.score_batch(df=df_synthetic_data, model_uri="models:/amine_elhelou.tko_fy25_hpo.hpo_model_ray_tune_optuna/2", result_type="string")
-
-# COMMAND ----------
-
-df_full = clean_df.union(df_synthetic_data)
+df_full = clean_df.union(df_synthetic_data_with_id)
 
 # COMMAND ----------
 
@@ -122,8 +129,12 @@ df_full.count()
 
 # COMMAND ----------
 
-df_full.write.format("delta").save(f"/Volumes/{catalog}/{schema}/synthetic-dataset/adult_synthetic")
+df_full.head()
 
 # COMMAND ----------
 
-df_full.write.format("parquet").save(f"/Volumes/{catalog}/{schema}/synthetic-dataset/adult_synthetic.parquet")
+df_full.write.saveAsTable(f"{catalog}.{schema}.adult_synthetic_raw")
+
+# COMMAND ----------
+
+# df_full.write.format("delta").save(f"/Volumes/{catalog}/{schema}/synthetic-dataset/adult_synthetic")
