@@ -1,4 +1,10 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC TO-DO:
+# MAGIC Fit a simple regression model on real data and batch infer on synthetic dataset instead of manually defining the output/`income` column
+
+# COMMAND ----------
+
 # MAGIC %pip install dbldatagen -qU
 # MAGIC
 # MAGIC

@@ -3,6 +3,9 @@
 # MAGIC # Ray On Spark for multimodal image batch inference
 # MAGIC **Pre-Requisites:**
 # MAGIC - Set this spark config at the cluster level: `spark.task.resource.gpu.amount 0` before starting the cluster
+# MAGIC
+# MAGIC
+# MAGIC **WORK-IN-PROGRESS**
 
 # COMMAND ----------
 
