@@ -10,14 +10,14 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -qU databricks-feature-engineering mlflow
+# MAGIC %pip install -qU databricks-feature-engineering mlflow optuna
 # MAGIC
-# MAGIC
+# MAGIC %pip install ucimlrepo
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
-catalog = "amine_elhelou" # Change This
+catalog = "jon_cheung" # Change This
 schema = "ray_gtm_examples"
 table = "adult_synthetic_raw"
 feature_table_name = "features_synthetic"
@@ -37,14 +37,26 @@ primary_key = "id"
 
 # COMMAND ----------
 
-# DBTITLE 1,Read synthetic dataset and write as feature and labels tables
+import pandas as pd
 from databricks.feature_engineering import FeatureEngineeringClient
+from ucimlrepo import fetch_ucirepo 
+  
+# fetch dataset 
+adult = fetch_ucirepo(id=2) 
+X = adult.data.features 
+y = adult.data.targets 
+y['income'].replace({"<=50K": 0, "<=50K.": 0,
+                     ">50K": 1, ">50K.": 1}, inplace=True)
 
+# build sdf 
+adult_synthetic_df = pd.concat([X, y], axis=1)
+adult_synthetic_df.reset_index(drop=False, inplace=True, names='id')
+adult_synthetic_sdf = spark.createDataFrame(adult_synthetic_df)
 
 fe = FeatureEngineeringClient()
 
 # Read dataset and remove duplicate keys
-adult_synthetic_df = spark.read.table(f"{catalog}.{schema}.{table}").dropDuplicates([primary_key])
+# adult_synthetic_df = spark.read.table(f"{catalog}.{schema}.{table}").dropDuplicates([primary_key])
 
 # Do this ONCE
 try:
@@ -52,15 +64,16 @@ try:
   fe.create_table(
     name=f"{catalog}.{schema}.{feature_table_name}",
     primary_keys=[primary_key],
-    df=adult_synthetic_df.drop(label),
+    df=adult_synthetic_sdf.drop(label),
     description="Adult Census feature"
   )
 
   # Extract ground-truth labels and primary key into separate dataframe
-  training_ids_df = adult_synthetic_df.select(primary_key, label)
+  training_ids_df = adult_synthetic_sdf.select(primary_key, label)
   training_ids_df.write.mode("overwrite").saveAsTable(f"{catalog}.{schema}.{labels_table_name}")
   print(f"... OK!")
 
+# will need to patch this exception
 except Exception as e:
   print(f"Table {feature_table_name} and {labels_table_name} already exists")
 
@@ -71,7 +84,7 @@ print(f"Created following catalog/schema/tables and variables:\n catalog = {cata
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load training dataset
+# MAGIC ## 1. Load training dataset
 # MAGIC
 # MAGIC First create feature lookups and training dataset specs
 
@@ -91,10 +104,8 @@ feature_lookups = [
 
 from databricks.feature_engineering import FeatureEngineeringClient
 
-
 # Read labels and ids
 training_ids_df = spark.table(f"{catalog}.{schema}.{labels_table_name}")
-
 
 fe = FeatureEngineeringClient()
 # Create training set
@@ -107,12 +118,12 @@ training_set = fe.create_training_set(
 
 # Get raw features and label
 training_pdf = training_set.load_df().toPandas()
-X, Y = (training_pdf.drop(label, axis=1), training_pdf[label])
+X, y = (training_pdf.drop(label, axis=1), training_pdf[label])
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create Universal preprocessing pipeline
+# MAGIC ## 2. Create Universal preprocessing pipeline
 
 # COMMAND ----------
 
@@ -147,6 +158,52 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Ser
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 3. Optional: Train one pipeline
+
+# COMMAND ----------
+
+import xgboost as xgb
+import mlflow
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+
+# Get raw features and label
+training_pdf = training_set.load_df().toPandas()
+X, y = (training_pdf.drop(label, axis=1), training_pdf[label])
+
+# XGB params
+params = {"objective": "binary:logistic",
+          "n_estimators": 100,
+          "max_depth": 8, 
+          "learning_rate": .01,
+          "max_bin": 256}
+
+# Pipeline
+preprocessor = initialize_preprocessing_pipeline(X, y)
+xgb_pipeline = Pipeline(steps=[("preprocessor", preprocessor), 
+                              ("classifier", xgb.XGBClassifier(**params))])
+
+# Create validation splits from the training data
+train_X, val_X, train_y, val_y = train_test_split(X, 
+                                                    y,
+                                                      test_size=0.2,
+                                                      random_state=42)
+
+# Disable mlflow autologging to avoid logging artifacts for every run
+mlflow.sklearn.autolog(disable=True) 
+
+# Train one XGB model
+xgb_pipeline.fit(train_X, train_y)
+
+# Predict on validation set
+y_val_pred = xgb_pipeline.predict(val_X)
+
+# Calculate and return validation F1-Score
+f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Define high-level experiments parameters
 # MAGIC
 # MAGIC Recommended Cluster Size for lab:
@@ -159,76 +216,6 @@ num_cpu_cores_per_worker = 4 # total cpu to use in each worker node
 max_worker_nodes = 2
 n_trials = 32 # Number of trials (arbitrary for demo purposes but has to be at least > 30 to see benefits of multinode)
 rng_seed = 2024 # Random Number Generation Seed for random states
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Define objective/loss function and search space to optimize
-# MAGIC **TO-DO**
-
-# COMMAND ----------
-
-import mlflow
-...
-from sklearn.metrics import f1_score
-from sklearn.model_selection import train_test_split
-
-
-class ObjectiveBoosting(object):
-  """
-  a callable class for implementing the objective function. It takes the training dataset by a constructor's argument
-  instead of loading it in each trial execution. This will speed up the execution of each trial
-  """
-  def __init__(self, X_train_in:pd.DataFrame, Y_train_in:pd.Series):
-    """
-    X_train_in: features
-    Y_train_in: label
-    """
-
-    # Create pre-processing pipeline
-    self.preprocessor = initialize_preprocessing_pipeline(X_train_in, Y_train_in)
-
-    # Split into training and validation set
-    X_train, X_val, Y_train, Y_val = train_test_split(X_train_in, Y_train_in, test_size=0.1, random_state=rng_seed)
-
-    self.X_train = X_train
-    self.Y_train = Y_train
-    self.X_val = X_val
-    self.Y_val = Y_val
-    
-  def __call__(self, trial):
-    """
-    Wrapper call containing data processing pipeline, training and hyperparameter tuning code.
-    The function returns the weighted F1 accuracy metric to maximize in this case.
-    """
-
-    # TO-DO 
-    
-    # Assemble the pipeline
-    this_model = Pipeline(steps=[("preprocessor", self.preprocessor), ("classifier", classifier_obj)])
-
-    # Fit the model
-    mlflow.sklearn.autolog(disable=True) # Disable mlflow autologging to avoid logging artifacts for every run
-    this_model.fit(self.X_train, self.Y_train)
-
-    # Predict on validation set
-    y_val_pred = this_model.predict(self.X_val)
-
-    # Calculate and return F1-Score
-    f1_score_binary= f1_score(self.Y_val, y_val_pred, average="binary", pos_label='>50K')
-
-    return f1_score_binary
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Test locally on driver node
-
-# COMMAND ----------
-
-# DBTITLE 1,Quick test/debug
-objective_fn = ObjectiveBoosting(X, Y)
-...
 
 # COMMAND ----------
 
@@ -249,7 +236,6 @@ import os
 import ray
 from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster, MAX_NUM_WORKER_NODES
 
-
 # Cluster cleanup
 restart = True
 if restart is True:
@@ -264,15 +250,14 @@ if restart is True:
     pass
 
 # Set configs based on your cluster size
-num_cpu_cores_per_worker = 3 # total cpu to use in each worker node (total_cores - 1 to leave one core for spark)
-num_cpus_head_node = 3 # Cores to use in driver node (total_cores - 1)
+num_cpu_cores_per_worker = 16 # total cpu to use in each worker node (total_cores - 1 to leave one core for spark)
+num_cpus_head_node = 8 # Cores to use in driver node (total_cores - 1)
 max_worker_nodes = 2
-
 
 ray_conf = setup_ray_cluster(
   min_worker_nodes=max_worker_nodes,
   max_worker_nodes=max_worker_nodes,
-  num_cpus_head_node= num_cpus_head_node,
+  num_cpus_head_node=num_cpus_head_node,
   num_cpus_per_node=num_cpu_cores_per_worker,
   num_gpus_head_node=0,
   num_gpus_worker_node=0
@@ -301,7 +286,8 @@ import os
 import ray
 from ray import train
 from sklearn.metrics import f1_score
-...
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
 from typing import Dict, Optional, Any
 
 
@@ -309,46 +295,54 @@ def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_tr
     """
     Wrapper training/objective function for ray tune
     """
+    
+    # Set mlflow credentials and active MLflow experiment for each Ray task
+    os.environ.update(mlflow_db_creds_in)
+    mlflow.set_experiment(experiment_name_in)
+    
+    # Pipeline
+    preprocessor = initialize_preprocessing_pipeline(X_train_in, Y_train_in)
+    xgb_pipeline = Pipeline(steps=[("preprocessor", preprocessor), 
+                                ("classifier", xgb.XGBClassifier(**config))])
+    
+    # Create validation splits from the training data
+    train_X, val_X, train_y, val_y = train_test_split(X_train_in, 
+                                                        Y_train_in,
+                                                         test_size=0.2,
+                                                          random_state=rng_seed)
+    
+    # Disable mlflow autologging to avoid logging artifacts for every run
+    mlflow.sklearn.autolog(disable=True) 
+    # Start nested child run for HPO tuning
+    with mlflow.start_run(run_name="hpo_run",
+                          parent_run_id=parent_run_id) as child_run:
 
-    #TO-DO
-        # Fit the model
-        # mlflow.sklearn.autolog(disable=True) # Disable mlflow autologging to minimize overhead
-        this_model.fit(X_train, Y_train)
+        xgb_pipeline.fit(train_X, train_y)
 
         # Predict on validation set
-        y_val_pred = this_model.predict(X_val)
+        y_val_pred = xgb_pipeline.predict(val_X)
 
         # Calculate and return F1-Score
-        f1_score_binary= f1_score(Y_val, y_val_pred, average="binary", pos_label='>50K')
-
+        f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
         # Log
-        train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
-        mlflow.log_metrics({"f1_score_val": f1_score_binary}) # to mlflow
+        mlflow.log_metrics({"f1_score_val": f1_score_binary}) # to mlfl ow
+     
+    train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
 
 
+# The search space sampling can be defined by 
+# 1) a "define by run function" (see below) which uses Optuna's native sampling OR
+# 2) a dictionary with a different sampling function (i.e. Ray Tune's sampler)
 def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
     """
-    Define-by-run function to create the search space.
+    Define-by-run function to create the search space. Trial suggestions automatically return a dictionary.
     """
-
-    classifier_name = trial.suggest_categorical("classifier", ["LogisticRegression", "RandomForest", "LightGBM"]) #, "XGBoost"])
-
-    # Define-by-run allows for conditional search spaces.
-    if classifier_name == "LogisticRegression":
-        trial.suggest_float("C", 1e-2, 1, log=True)
-        trial.suggest_float('tol' , 1e-6 , 1e-3, step=1e-6)
-    elif classifier_name == "RandomForest":
-        trial.suggest_int("n_estimators", 10, 200, log=True)
-        trial.suggest_int("max_depth", 3, 10)
-        trial.suggest_int("min_samples_split", 2, 10)
-        trial.suggest_int("min_samples_leaf", 1, 10)
-    else:
-        trial.suggest_int("n_estimators", 10, 200, log=True)
-        trial.suggest_int("max_depth", 3, 10)
-        trial.suggest_float("learning_rate", 1e-2, 0.9)
-        trial.suggest_int("max_bin", 2, 256)
-        trial.suggest_int("num_leaves", 2, 256),
-        
+    trial.suggest_categorical("objective", ["binary:logistic"])
+    trial.suggest_int("n_estimators", 10, 200, log=True)
+    trial.suggest_int("max_depth", 3, 10)
+    trial.suggest_float("learning_rate", 1e-2, 0.9)
+    trial.suggest_int("max_bin", 2, 256)
+    
     # Return all constants in a dictionary.
 
 # COMMAND ----------
@@ -369,26 +363,22 @@ from mlflow.pyfunc import PyFuncModel
 from mlflow import pyfunc
 from mlflow.utils.databricks_utils import get_databricks_env_vars
 from ray import tune
-from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
+from ray.air.integrations.mlflow import setup_mlflow
 from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 
 
-# Grab and set experiment
-mlflow_db_creds = get_databricks_env_vars("databricks")
-experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
-mlflow.set_experiment(experiment_name)
-model_name=f"{catalog}.{schema}.hpo_model_ray_tune_optuna"
+# XGBoost benefits from multi-threading (i.e. leveraging parallel threads to speed up the construction of weak learners). Here you can allocate the number of CPUs to use per XGboost model. We suggest setting this to the number of CPUs per worker. 
+objective_with_resources = tune.with_resources(objective_ray, 
+                                               {"cpu": num_cpu_cores_per_worker})
 
-# Hold-out Test/Train set
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=rng_seed)
-
-# Define Optuna search algo
+# Define Optuna search algo with concurrency limiter
+# We set a concurrency limiter to limit the number of parallel trials. This is important for Bayesian search (inherently sequential) as too many parallel trials reduces the benefits of priors to inform the next search round.
 searcher = OptunaSearch(space=define_by_run_func, metric="f1_score_val", mode="max")
 algo = ConcurrencyLimiter(searcher,
                           max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node
                         )
+
 
 # COMMAND ----------
 
@@ -397,14 +387,24 @@ algo = ConcurrencyLimiter(searcher,
 
 # COMMAND ----------
 
-with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as parent_run:
-    mlflow_tracking_uri = mlflow.get_tracking_uri()
-    os.environ.update(mlflow_db_creds)
+# Define your experiment name
+experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+mlflow.set_experiment(experiment_name)
+
+# Since we want to create nested child runs to organize our HPO experiment, we need to pass in the mlflow credentials to each Ray actor.
+mlflow_db_creds = get_databricks_env_vars("databricks")
+model_name=f"{catalog}.{schema}.hpo_model_ray_tune_optuna"
+
+# Load the X, y dataset for training
+X, y = (training_pdf.drop(label, axis=1), training_pdf[label])
+
+# Start the parent mlflow run that will also house the best model 
+with mlflow.start_run(run_name ='ray_tune') as parent_run:
     tuner = tune.Tuner(
         ray.tune.with_parameters(
-            objective_ray,
+            objective_with_resources,
             parent_run_id = parent_run.info.run_id,
-            X_train_in = X_train, Y_train_in = Y_train,
+            X_train_in = X, Y_train_in = y,
             experiment_name_in=experiment_name,
             mlflow_db_creds_in=mlflow_db_creds),
         tune_config=tune.TuneConfig(
@@ -417,29 +417,29 @@ with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as pare
     multinode_results = tuner.fit()
 
     # Extract best trial info
-    best_model_params = multinode_results.get_best_result(metric="f1_score_val", mode="max", scope='last').config
+    best_model_params = multinode_results.get_best_result(metric="f1_score_val",
+                                                           mode="max",
+                                                            scope='last').config
     best_model_params["random_state"] = rng_seed
-    classifier_type = best_model_params.pop('classifier')
     
     # Reproduce best classifier
-    if classifier_type  == "LogisticRegression":
-        best_model = LogisticRegression(**best_model_params)
-    elif classifier_type == "RandomForestClassifier":
-        best_model = RandomForestClassifier(**best_model_params)
-    elif classifier_type == "LightGBM":
-        best_model = LGBMClassifier(force_row_wise=True, verbose=-1, **best_model_params)
+    best_model = xgb.XGBClassifier(**best_model_params)
 
     # Enable automatic logging of input samples, metrics, parameters, and models
-    mlflow.sklearn.autolog(log_input_examples=True, log_models=False, silent=True)
+    mlflow.sklearn.autolog(log_input_examples=True,
+                            log_models=False,
+                             silent=True)
     
-    # Fit best model and log using FE client in parent run
-    preprocessor = initialize_preprocessing_pipeline(X_train, Y_train)
-    model_pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("classifier", best_model)])
-    model_pipeline.fit(X_train, Y_train)
+    # Fit best model and log using FE client in parent run.
+    # Note that since this is our final model, we will train using all the data
+    preprocessor = initialize_preprocessing_pipeline(X, y)
+    model_pipeline = Pipeline(steps=[("preprocessor", preprocessor),
+                                      ("classifier", best_model)])
+    model_pipeline.fit(X, y)
 
     # Infer output schema
     try:
-        output_schema = _infer_schema(Y_train)
+        output_schema = _infer_schema(y)
     
     except Exception as e:
         warnings.warn(f"Could not infer model output schema: {e}")
@@ -462,22 +462,22 @@ with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as pare
     # Log metrics for the training set
     training_eval_result = mlflow.evaluate(
         model=pyfunc_model,
-        data=X_train.assign(**{str(label):Y_train}),
+        data=X.assign(**{str(label):y}),
         targets=label,
         model_type="classifier",
         evaluator_config = {"log_model_explainability": False,
-                            "metric_prefix": "training_" , "pos_label": ">50K" }
+                            "metric_prefix": "training_" , "pos_label": 1}
     )
 
-    # Log metrics for the test set
-    val_eval_result = mlflow.evaluate(
-        model=pyfunc_model,
-        data=X_test.assign(**{str(label):Y_test}),
-        targets=label,
-        model_type="classifier",
-        evaluator_config = {"log_model_explainability": False,
-                            "metric_prefix": "test_" , "pos_label": ">50K" }
-    )
+    # # Log metrics for the test set
+    # val_eval_result = mlflow.evaluate(
+    #     model=pyfunc_model,
+    #     data=X_test.assign(**{str(label):Y_test}),
+    #     targets=label,
+    #     model_type="classifier",
+    #     evaluator_config = {"log_model_explainability": False,
+    #                         "metric_prefix": "test_" , "pos_label": ">50K" }
+    # )
 
     mlflow.end_run()
 
