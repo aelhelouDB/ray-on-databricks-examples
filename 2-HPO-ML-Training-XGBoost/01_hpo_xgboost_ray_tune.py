@@ -28,7 +28,7 @@ primary_key = "id"
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create feature table
+# MAGIC ## 0. Create feature table
 
 # COMMAND ----------
 
@@ -204,7 +204,21 @@ f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Define high-level experiments parameters
+# MAGIC ## 4. Scaling HPO with Ray Tune
+# MAGIC
+# MAGIC Ray Tune allows hyperparameter optimization through several key capabilities:
+# MAGIC 1. **Search space definition**: defining a search space for hyperparameters using Ray Tune's API, specifying ranges and distributions for parameters to explore.
+# MAGIC 2. **Trainable functions**: wrapping the model training code in a "trainable" function that Ray Tune can call with different hyperparameter configurations.
+# MAGIC 3. **Search algorithms**: Ray Tune provides search algorithms like grid, random, and Bayesian. Ray Tune also integrates well with other frameworks like Optuna and Hyperopt. 
+# MAGIC 4. **Parallel execution**: running multiple trials (hyperparameter configurations) in parallel across a cluster of machines.
+# MAGIC 5. **Early stopping**: Ray Tune supports early stopping of poorly performing trials to save compute resources
+# MAGIC
+# MAGIC To get started with Ray, we'll set up a Ray cluster and then Ray Tune workflow, encapsulating all the above.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4a. Setting up your Ray cluster. 
 # MAGIC
 # MAGIC Recommended Cluster Size for lab:
 # MAGIC * Driver node with 4 cores & min 30GB of RAM
@@ -214,20 +228,9 @@ f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
 
 num_cpu_cores_per_worker = 4 # total cpu to use in each worker node
 max_worker_nodes = 2
+# Define high-level experiments parameters
 n_trials = 32 # Number of trials (arbitrary for demo purposes but has to be at least > 30 to see benefits of multinode)
 rng_seed = 2024 # Random Number Generation Seed for random states
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1. Scaling HPO with Ray Tune
-# MAGIC
-# MAGIC Ray Tune allows hyperparameter optimization through several key capabilities:
-# MAGIC 1. Search space definition: defining a search space for hyperparameters using Ray Tune's API, specifying ranges and distributions for parameters to explore.
-# MAGIC 2. Trainable functions: wrapping the model training code in a "trainable" function that Ray Tune can call with different hyperparameter configurations.
-# MAGIC 3. Search algorithms: Ray Tune provides various search algorithms like random search, Bayesian optimization, etc.
-# MAGIC 4. Parallel execution: running multiple trials (hyperparameter configurations) in parallel across a cluster of machines.
-# MAGIC 5. **Early stopping**: Ray Tune supports early stopping of poorly performing trials to save compute resources
 
 # COMMAND ----------
 
@@ -267,19 +270,16 @@ os.environ['RAY_ADDRESS'] = ray_conf[0]
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC **Ray Tune workflow:**
-# MAGIC 1. Define search space by wrapping training code in a trainable function
-# MAGIC 2. Configure the tuning process (algorithm, resources, etc.): we'll use `ASHA` as the scheduler.
-# MAGIC 3. Launch the tuning job using the `Tuner` class
-# MAGIC 4. Analyze results to find the best hyperparameters and fit the best model using the `fe()` client
+# MAGIC ### 4b. Ray Tune workflow:
+# MAGIC 1. Write your trainable (i.e. objective) function --> `trainable_with_resources`
+# MAGIC 2. Configure your search space and algorithm --> `searcher_with_concurrency`
+# MAGIC 3. Run an HPO search using `Ray Tune` + final training pipeline. This will:
+# MAGIC     * a. Launch the tuning job using the `Tuner` class, searching across `n_trials`
+# MAGIC     * b. Analyze results for best hyperparameters and then fit, log, and register the final model.
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Define objective/loss function and search space
-
-# COMMAND ----------
-
+# DBTITLE 1,Write your trainable function and configure resources
 import pandas as pd
 import mlflow
 import os
@@ -289,9 +289,10 @@ from sklearn.metrics import f1_score
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 from typing import Dict, Optional, Any
+from ray import tune
 
 
-def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_train_in:pd.Series, experiment_name_in:str, mlflow_db_creds_in:dict):
+def xgb_ray_trainable(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_train_in:pd.Series, experiment_name_in:str, mlflow_db_creds_in:dict):
     """
     Wrapper training/objective function for ray tune
     """
@@ -311,9 +312,9 @@ def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_tr
                                                          test_size=0.2,
                                                           random_state=rng_seed)
     
-    # Disable mlflow autologging to avoid logging artifacts for every run
+    # Disable mlflow autologging to avoid logging artifacts for every child run
     mlflow.sklearn.autolog(disable=True) 
-    # Start nested child run for HPO tuning
+    # Start a nested child run for HPO tuning
     with mlflow.start_run(run_name="hpo_run",
                           parent_run_id=parent_run_id) as child_run:
 
@@ -329,32 +330,14 @@ def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_tr
      
     train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
 
+# XGBoost benefits from multi-threading (i.e. leveraging parallel threads to speed up the construction of weak learners). Here you can allocate the number of CPUs to use per XGboost model. We suggest setting this to the number of CPUs equal to or less than the number of CPUs available on the worker (i.e. <16 in this tutorial)
+trainable_with_resources = tune.with_resources(xgb_ray_trainable, 
+                                               {"cpu": 8})
 
-# The search space sampling can be defined by 
-# 1) a "define by run function" (see below) which uses Optuna's native sampling OR
-# 2) a dictionary with a different sampling function (i.e. Ray Tune's sampler)
-def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
-    """
-    Define-by-run function to create the search space. Trial suggestions automatically return a dictionary.
-    """
-    trial.suggest_categorical("objective", ["binary:logistic"])
-    trial.suggest_int("n_estimators", 10, 200, log=True)
-    trial.suggest_int("max_depth", 3, 10)
-    trial.suggest_float("learning_rate", 1e-2, 0.9)
-    trial.suggest_int("max_bin", 2, 256)
-    
-    # Return all constants in a dictionary.
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Configure ray tune's algo and concurrency
-# MAGIC
-# MAGIC * TO-DO 
-# MAGIC * **TO-DO:** Update mlflow callbacks section
-
-# COMMAND ----------
-
+# DBTITLE 1,Configure your search space and algorithm
 import warnings
 from mlflow.types.utils import _infer_schema
 from mlflow.exceptions import MlflowException
@@ -362,31 +345,36 @@ from mlflow.models import Model
 from mlflow.pyfunc import PyFuncModel
 from mlflow import pyfunc
 from mlflow.utils.databricks_utils import get_databricks_env_vars
-from ray import tune
 from ray.air.integrations.mlflow import setup_mlflow
 from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 
 
-# XGBoost benefits from multi-threading (i.e. leveraging parallel threads to speed up the construction of weak learners). Here you can allocate the number of CPUs to use per XGboost model. We suggest setting this to the number of CPUs per worker. 
-objective_with_resources = tune.with_resources(objective_ray, 
-                                               {"cpu": num_cpu_cores_per_worker})
+# The search space sampling can be defined by 
+# 1) a "define by run function" (see below) which uses Optuna's native sampling OR
+# 2) a dictionary with a different sampling function (i.e. Ray Tune's sampler)
+def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
+    """
+    Define-by-run function to create the search space. Trial suggestions automatically return a dictionary that's passed to the trainable function.
+    """
+    trial.suggest_categorical("objective", ["binary:logistic"])
+    trial.suggest_int("n_estimators", 10, 200, log=True)
+    trial.suggest_int("max_depth", 3, 10)
+    trial.suggest_float("learning_rate", 1e-2, 0.9)
+    trial.suggest_int("max_bin", 2, 256)
 
-# Define Optuna search algo with concurrency limiter
-# We set a concurrency limiter to limit the number of parallel trials. This is important for Bayesian search (inherently sequential) as too many parallel trials reduces the benefits of priors to inform the next search round.
+# Define Optuna search algo with concurrency limiter.
+# Note: A concurrency limiter, limits the number of parallel trials. This is important for Bayesian search (inherently sequential) as too many parallel trials reduces the benefits of priors to inform the next search round.
 searcher = OptunaSearch(space=define_by_run_func, metric="f1_score_val", mode="max")
-algo = ConcurrencyLimiter(searcher,
-                          max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node
+# This is the object of our search algorithm
+searcher_with_concurrency = ConcurrencyLimiter(searcher,
+                                               max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node
                         )
 
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Execute
-
-# COMMAND ----------
-
+# DBTITLE 1,Run HPO search + train final model
 # Define your experiment name
 experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 mlflow.set_experiment(experiment_name)
@@ -400,15 +388,16 @@ X, y = (training_pdf.drop(label, axis=1), training_pdf[label])
 
 # Start the parent mlflow run that will also house the best model 
 with mlflow.start_run(run_name ='ray_tune') as parent_run:
+    # Run our Tuner job
     tuner = tune.Tuner(
         ray.tune.with_parameters(
-            objective_with_resources,
+            trainable_with_resources,
             parent_run_id = parent_run.info.run_id,
             X_train_in = X, Y_train_in = y,
             experiment_name_in=experiment_name,
             mlflow_db_creds_in=mlflow_db_creds),
         tune_config=tune.TuneConfig(
-            search_alg=algo,
+            search_alg=searcher_with_concurrency,
             num_samples=n_trials,
             reuse_actors = True # Highly recommended for short training jobs (NOT RECOMMENDED FOR GPU AND LONG TRAINING JOBS)
             )
@@ -486,7 +475,3 @@ with mlflow.start_run(run_name ='ray_tune') as parent_run:
 # DBTITLE 1,Elapsed time excluding best model fitting, logging and evaluation
 rt_trials_pdf = multinode_results.get_dataframe()
 print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(rt_trials_pdf['timestamp'].iloc[-1] - rt_trials_pdf['timestamp'].iloc[0] + rt_trials_pdf['time_total_s'].iloc[-1])/60} min")
-
-# COMMAND ----------
-
-
