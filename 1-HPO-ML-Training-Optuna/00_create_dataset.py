@@ -40,10 +40,13 @@ table_schema = """`age` DOUBLE,
 `native_country` STRING,
 `income` STRING"""
 
+primary_key = "id"
+
 # Read data and add a unique id column to use as primary key
 raw_df = (
   spark.read.csv("/databricks-datasets/adult/adult.data", schema=table_schema)
   .withColumn(primary_key, F.expr("uuid()"))
+  .drop("education")
 )
 
 # Trim all strings and replace "?" with None/Null value
@@ -53,10 +56,6 @@ for field in raw_df.schema.fields:
         clean_df = clean_df.withColumn(field.name, F.trim(F.col(field.name)))
 
 clean_df = clean_df.na.replace("?", None)
-
-# COMMAND ----------
-
-clean_df.groupBy("income").count().display()
 
 # COMMAND ----------
 
@@ -99,7 +98,6 @@ generation_spec = (
     .withColumn('age', 'double', minValue=17, maxValue=95, step=1)
     .withColumn('workclass', 'string', values=['State-gov', 'Self-emp-not-inc', 'Private', 'Federal-gov', 'Local-gov', 'Without-pay', 'Never-worked'])
     .withColumn('fnlwgt', 'double', minValue=12285.0, maxValue=1484705.0, step=2)
-    .withColumn('education', 'string', values=['Masters', 'HS-grad', 'Bachelors', 'Some-college', 'Assoc-voc', 'HS-grad', 'Masters', 'Bachelors', 'Some-college', 'Prof-school', 'Doctorate', 'Assoc-acdm', 'Preschool', '10th', '12th', '5th-6th', '7th-8th', '11th'])
     .withColumn('education_num', 'double', minValue=1, maxValue=16, step=1)
     .withColumn('marital_status', 'string', values=['Married-spouse-absent','Married-civ-spouse','Divorced','Separated','Never-married', 'Married-AF-spouse'])
     .withColumn('occupation', 'string', values=occupation_list)
@@ -110,7 +108,6 @@ generation_spec = (
     .withColumn('capital_loss', 'double', minValue=0.0, maxValue=5000, step=100)
     .withColumn('hours_per_week', 'double', minValue=1.0, maxValue=100.0, step=1)
     .withColumn('native_country', 'string', values=country_list)
-    .withColumn('income', 'string', values=['<=50K', '>50K'], weights=[0.75, 0.25])
     )
 
 # COMMAND ----------
@@ -119,14 +116,64 @@ df_synthetic_data = generation_spec.build()
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import classification_report
+import pandas as pd
 
 
-df_synthetic_data_with_id = df_synthetic_data \
+# Convert Spark DataFrame to Pandas DataFrame
+clean_pdf = clean_df.toPandas()
+
+# Define features and target
+X = clean_pdf.drop(columns=[primary_key, 'income'])
+y = clean_pdf['income']
+
+# Split and train on only 60% of dataset
+X_train, _, y_train, _ = train_test_split(X, y, test_size=0.4, random_state=2025)
+
+# Preprocessing pipeline
+categorical_cols = [col for col in X_train if X_train[col].dtype == "object"]
+numerical_cols = [col for col in X_train if X_train[col].dtype != "object"]
+cat_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='most_frequent')),("one_hot_encoder", OneHotEncoder(handle_unknown="ignore"))])
+num_pipeline = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', num_pipeline, numerical_cols),
+        ('cat', cat_pipeline, categorical_cols)])
+
+# Create logistic regression pipeline
+clf = Pipeline(steps=[('preprocessor', preprocessor),
+                      ('classifier', LogisticRegression())])
+
+# Train the model
+clf.fit(X_train, y_train)
+
+# COMMAND ----------
+
+# Predict on synthetic dataset
+X_synth_pdf = df_synthetic_data.toPandas()
+X_synth_pdf["income"] = clf.predict(X_synth_pdf)
+
+# Convert Pandas DataFrame to Spark DataFrame
+df_synthetic_with_label = spark.createDataFrame(X_synth_pdf)
+
+# COMMAND ----------
+
+# Add random id column
+df_synthetic_data_with_id =  df_synthetic_with_label \
   .withColumn("id", F.expr("uuid()"))
 
 # COMMAND ----------
 
+# Join
 df_full = clean_df.union(df_synthetic_data_with_id)
 
 # COMMAND ----------
@@ -135,11 +182,11 @@ df_full.count()
 
 # COMMAND ----------
 
-df_full.head()
+df_full.tail(1)
 
 # COMMAND ----------
 
-df_full.write.saveAsTable(f"{catalog}.{schema}.adult_synthetic_raw")
+df_full.write.mode("overwrite").option("mergeSchema", True).saveAsTable(f"{catalog}.{schema}.adult_synthetic_raw")
 
 # COMMAND ----------
 

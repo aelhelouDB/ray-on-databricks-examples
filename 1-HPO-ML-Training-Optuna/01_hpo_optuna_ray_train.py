@@ -9,14 +9,20 @@
 # MAGIC 1. For single node use [Optuna](https://github.com/optuna/optuna) which naitvely supports mlflow callbacks. This approach is recommended if:
 # MAGIC     1. You only have a single/big machine available
 # MAGIC     2. Single training run takes less than 2 seconds (based on dataset size and model architecture)
-# MAGIC 2. For multi-node use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) by leveraging [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html) 
+# MAGIC 2. For multi-node use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) by leveraging [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html)
+# MAGIC     1. Set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster before starting and attaching the notebook to it
+
+# COMMAND ----------
+
+# DBTITLE 1,Remove this later once ray code freeze is unlocked
+# MAGIC %pip install "ray[default] @ https://ml-team-public-read.s3.us-west-2.amazonaws.com/weichen-temp/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl"
 
 # COMMAND ----------
 
 # MAGIC %pip install -qU databricks-feature-engineering optuna optuna-integration mlflow
 # MAGIC
 # MAGIC
-# MAGIC dbutils.library.restartPython()
+# MAGIC %restart_python
 
 # COMMAND ----------
 
@@ -40,12 +46,20 @@ primary_key = "id"
 
 # COMMAND ----------
 
-# DBTITLE 1,Read synthetic dataset and write as feature and labels tables
 from databricks.feature_engineering import FeatureEngineeringClient
 
 
 fe = FeatureEngineeringClient()
 
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC DROP TABLE IF EXISTS amine_elhelou.ray_gtm_examples.features_synthetic;
+# MAGIC DROP TABLE IF EXISTS amine_elhelou.ray_gtm_examples.labels_synthetic
+
+# COMMAND ----------
+
+# DBTITLE 1,Read synthetic dataset and write as feature and labels tables
 # Read dataset and remove duplicate keys
 adult_synthetic_df = spark.read.table(f"{catalog}.{schema}.{table}").dropDuplicates([primary_key])
 
@@ -92,14 +106,9 @@ feature_lookups = [
 
 # COMMAND ----------
 
-from databricks.feature_engineering import FeatureEngineeringClient
-
-
 # Read labels and ids
 training_ids_df = spark.table(f"{catalog}.{schema}.{labels_table_name}")
 
-
-fe = FeatureEngineeringClient()
 # Create training set
 training_set = fe.create_training_set(
     df=training_ids_df,
@@ -123,10 +132,10 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
 
 
-def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Series):
+def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame):
   """
   Helper function to create pre-processing pipeline
   """
@@ -134,15 +143,13 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Ser
   categorical_cols = [col for col in X_train_in if X_train_in[col].dtype == "object"]
   numerical_cols = [col for col in X_train_in if X_train_in[col].dtype != "object"]
   cat_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='most_frequent')),("one_hot_encoder", OneHotEncoder(handle_unknown="ignore"))])
-  num_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='median'))])                        
+  num_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='median')), ("scaler", StandardScaler())])                        
 
   preprocessor = ColumnTransformer(
-    [
+    transformers=[
       ("cat", cat_pipeline, categorical_cols),
       ("num", num_pipeline, numerical_cols)
-    ],
-    remainder="passthrough",
-    sparse_threshold=0
+    ]
   )
   
   return preprocessor
@@ -161,7 +168,7 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Ser
 num_cpu_cores_per_worker = 4 # total cpu to use in each worker node
 max_worker_nodes = 2
 n_trials = 32 # Number of trials (arbitrary for demo purposes but has to be at least > 30 to see benefits of multinode)
-rng_seed = 2024 # Random Number Generation Seed for random states
+rng_seed = 2025 # Random Number Generation Seed for random states
 
 # COMMAND ----------
 
@@ -233,7 +240,7 @@ class ObjectiveOptuna(object):
     """
 
     # Create pre-processing pipeline
-    self.preprocessor = initialize_preprocessing_pipeline(X_train_in, Y_train_in)
+    self.preprocessor = initialize_preprocessing_pipeline(X_train_in)
 
     # Split into training and validation set
     X_train, X_val, Y_train, Y_val = train_test_split(X_train_in, Y_train_in, test_size=0.1, random_state=rng_seed)
@@ -475,6 +482,7 @@ print(f"Elapsed time for HPO on driver/single node for {n_trials} experiments: {
 import os
 import ray
 from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster, MAX_NUM_WORKER_NODES
+from mlflow.utils.databricks_utils import get_databricks_env_vars
 
 
 # Cluster cleanup
@@ -495,6 +503,10 @@ num_cpu_cores_per_worker = 3 # total cpu to use in each worker node (total_cores
 num_cpus_head_node = 3 # Cores to use in driver node (total_cores - 1)
 max_worker_nodes = 2
 
+# Set databricks credentials as env vars
+mlflow_dbrx_creds = get_databricks_env_vars("databricks")
+os.environ["DATABRICKS_HOST"] = mlflow_dbrx_creds['DATABRICKS_HOST']
+os.environ["DATABRICKS_TOKEN"] = mlflow_dbrx_creds['DATABRICKS_TOKEN']
 
 ray_conf = setup_ray_cluster(
   min_worker_nodes=max_worker_nodes,
@@ -519,15 +531,19 @@ os.environ['RAY_ADDRESS'] = ray_conf[0]
 
 # MAGIC %md
 # MAGIC ### Define objective/loss function and search space
+# MAGIC
+# MAGIC * pick and configure `Optuna` from [ray.tune.search](https://docs.ray.io/en/latest/tune/api/suggestion.html)
+# MAGIC * use the [ConcurrencyLimiter](https://docs.ray.io/en/latest/tune/api/doc/ray.tune.search.ConcurrencyLimiter.html#ray.tune.search.ConcurrencyLimiter) to limit number of concurrent trials
 
 # COMMAND ----------
 
 import pandas as pd
 import mlflow
-import os
 import ray
 from lightgbm import LGBMClassifier
 from ray import train
+from ray.tune.search import ConcurrencyLimiter
+from ray.tune.search.optuna import OptunaSearch
 from sklearn.metrics import f1_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -536,7 +552,7 @@ from sklearn.pipeline import Pipeline
 from typing import Dict, Optional, Any
 
 
-def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_train_in:pd.Series, experiment_name_in:str, mlflow_db_creds_in:dict):
+def objective_ray(config: dict, X_train_in:pd.DataFrame, Y_train_in:pd.Series):
     """
     Wrapper training/objective function for ray tune
     """
@@ -566,35 +582,25 @@ def objective_ray(config: dict, parent_run_id:str, X_train_in:pd.DataFrame, Y_tr
         classifier_obj = LGBMClassifier(force_row_wise=True, verbose=-1,
                                         n_estimators=n_estimators, max_depth=max_depth, learning_rate=learning_rate, max_bin=max_bin, num_leaves=num_leaves, random_state=rng_seed)
 
-    # Update databricks credentials (NEED TO DO THIS BECAUSE RAY EXECUTORS ARE DESTROYED AFTER EVERY RUN)
-    os.environ.update(mlflow_db_creds_in)
-    mlflow.set_experiment(experiment_name_in)
 
-    # Start child HPO runs under the same parent run
-    with mlflow.start_run(nested=True, parent_run_id=parent_run_id):
-        # Log hyperparameters
-        mlflow.log_params(config)
+    # Initialize pipeline
+    preprocessor = initialize_preprocessing_pipeline(X_train_in)
+    this_model = Pipeline(steps=[("preprocessor", preprocessor), ("classifier", classifier_obj)])
 
-         # Initialize pipeline
-        preprocessor = initialize_preprocessing_pipeline(X_train_in, Y_train_in)
-        this_model = Pipeline(steps=[("preprocessor", preprocessor), ("classifier", classifier_obj)])
+    # Split into training and validation set
+    X_train, X_val, Y_train, Y_val = train_test_split(X_train_in, Y_train_in, test_size=0.1, random_state=rng_seed)
 
-        # Split into training and validation set
-        X_train, X_val, Y_train, Y_val = train_test_split(X_train_in, Y_train_in, test_size=0.1, random_state=rng_seed)
+    # Fit the model
+    this_model.fit(X_train, Y_train)
 
-        # Fit the model
-        # mlflow.sklearn.autolog(disable=True) # Disable mlflow autologging to minimize overhead
-        this_model.fit(X_train, Y_train)
+    # Predict on validation set
+    y_val_pred = this_model.predict(X_val)
 
-        # Predict on validation set
-        y_val_pred = this_model.predict(X_val)
+    # Calculate and return F1-Score
+    f1_score_binary= f1_score(Y_val, y_val_pred, average="binary", pos_label='>50K')
 
-        # Calculate and return F1-Score
-        f1_score_binary= f1_score(Y_val, y_val_pred, average="binary", pos_label='>50K')
-
-        # Log
-        train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
-        mlflow.log_metrics({"f1_score_val": f1_score_binary}) # to mlflow
+    # Log
+    train.report({"f1_score_val": f1_score_binary})
 
 
 def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
@@ -604,7 +610,7 @@ def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
     /tutorial/10_key_features/002_configurations.html
     """
 
-    classifier_name = trial.suggest_categorical("classifier", ["LogisticRegression", "RandomForest", "LightGBM"]) #, "XGBoost"])
+    classifier_name = trial.suggest_categorical("classifier", ["LogisticRegression", "RandomForest", "LightGBM"])
 
     # Define-by-run allows for conditional search spaces.
     if classifier_name == "LogisticRegression":
@@ -620,49 +626,22 @@ def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
         trial.suggest_int("max_depth", 3, 10)
         trial.suggest_float("learning_rate", 1e-2, 0.9)
         trial.suggest_int("max_bin", 2, 256)
-        trial.suggest_int("num_leaves", 2, 256),
-        
-    # Return all constants in a dictionary.
+        trial.suggest_int("num_leaves", 2, 256)
+
+
+# Define Optuna search algo
+searcher = OptunaSearch(space=define_by_run_func, metric="f1_score_val", mode="max")
+algo = ConcurrencyLimiter(searcher, max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ### Configure ray tune's algo and concurrency
-# MAGIC
-# MAGIC * pick and configure `Optuna` from [ray.tune.search](https://docs.ray.io/en/latest/tune/api/suggestion.html)
-# MAGIC * use the [ConcurrencyLimiter](https://docs.ray.io/en/latest/tune/api/doc/ray.tune.search.ConcurrencyLimiter.html#ray.tune.search.ConcurrencyLimiter) to limit number of concurrent trials
-# MAGIC * **TO-DO:** Update mlflow callbacks section
-
-# COMMAND ----------
-
-import warnings
-from mlflow.types.utils import _infer_schema
-from mlflow.exceptions import MlflowException
-from mlflow.models import Model
-from mlflow.pyfunc import PyFuncModel
-from mlflow import pyfunc
-from mlflow.utils.databricks_utils import get_databricks_env_vars
-from ray import tune
-from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
-from ray.tune.search import ConcurrencyLimiter
-from ray.tune.search.optuna import OptunaSearch
-
-
-# Grab and set experiment
-mlflow_db_creds = get_databricks_env_vars("databricks")
+# Grab experiment and model name
 experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
-mlflow.set_experiment(experiment_name)
 model_name=f"{catalog}.{schema}.hpo_model_ray_tune_optuna"
 
 # Hold-out Test/Train set
 X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=rng_seed)
-
-# Define Optuna search algo
-searcher = OptunaSearch(space=define_by_run_func, metric="f1_score_val", mode="max")
-algo = ConcurrencyLimiter(searcher,
-                          max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node
-                        )
 
 # COMMAND ----------
 
@@ -671,21 +650,37 @@ algo = ConcurrencyLimiter(searcher,
 
 # COMMAND ----------
 
-with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as parent_run:
-    mlflow_tracking_uri = mlflow.get_tracking_uri()
-    os.environ.update(mlflow_db_creds)
+import warnings
+from mlflow.exceptions import MlflowException
+from mlflow.models import Model
+from mlflow.pyfunc import PyFuncModel
+from mlflow import pyfunc
+from ray import tune
+from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
+
+
+mlflow.set_experiment(experiment_name)
+
+with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id=experiment_id) as parent_run:
+    
+    # Tune with callback
     tuner = tune.Tuner(
         ray.tune.with_parameters(
             objective_ray,
-            parent_run_id = parent_run.info.run_id,
-            X_train_in = X_train, Y_train_in = Y_train,
-            experiment_name_in=experiment_name,
-            mlflow_db_creds_in=mlflow_db_creds),
+            X_train_in = X_train, Y_train_in = Y_train),
         tune_config=tune.TuneConfig(
             search_alg=algo,
             num_samples=n_trials,
             reuse_actors = True # Highly recommended for short training jobs (NOT RECOMMENDED FOR GPU AND LONG TRAINING JOBS)
-            )
+            ),
+        run_config=train.RunConfig(
+            name="mlflow",
+            callbacks=[
+                MLflowLoggerCallback(
+                    experiment_name=experiment_name,
+                    save_artifact=False,
+                    tags={"mlflow.parentRunId": parent_run.info.run_id})]
+        )
     )
 
     multinode_results = tuner.fit()
@@ -703,28 +698,17 @@ with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as pare
     elif classifier_type == "LightGBM":
         best_model = LGBMClassifier(force_row_wise=True, verbose=-1, **best_model_params)
 
-    # Enable automatic logging of input samples, metrics, parameters, and models
-    mlflow.sklearn.autolog(log_input_examples=True, log_models=False, silent=True)
     
     # Fit best model and log using FE client in parent run
-    preprocessor = initialize_preprocessing_pipeline(X_train, Y_train)
+    preprocessor = initialize_preprocessing_pipeline(X_train)
     model_pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("classifier", best_model)])
     model_pipeline.fit(X_train, Y_train)
-
-    # Infer output schema
-    try:
-        output_schema = _infer_schema(Y_train)
-    
-    except Exception as e:
-        warnings.warn(f"Could not infer model output schema: {e}")
-        output_schema = None
     
     fe.log_model(
         model=model_pipeline,
         artifact_path="model",
         flavor=mlflow.sklearn,
         training_set=training_set,
-        output_schema=output_schema,
         registered_model_name=model_name
     )
 
@@ -760,7 +744,3 @@ with mlflow.start_run(run_name ='ray_tune', experiment_id=experiment_id) as pare
 # DBTITLE 1,Elapsed time excluding best model fitting, logging and evaluation
 rt_trials_pdf = multinode_results.get_dataframe()
 print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(rt_trials_pdf['timestamp'].iloc[-1] - rt_trials_pdf['timestamp'].iloc[0] + rt_trials_pdf['time_total_s'].iloc[-1])/60} min")
-
-# COMMAND ----------
-
-
