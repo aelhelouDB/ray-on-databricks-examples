@@ -4,13 +4,13 @@
 # MAGIC
 # MAGIC In this example we'll cover the new recommended ways for performing distributed hyperparameter optimization on databricks, while also leveraging MLflow for tracking experiments and the feature engineering client to ensure lineage between models and feature tables.
 # MAGIC
-# MAGIC We'll cover 2 approaches (based on dataset size, training time/model complexity, hardware availability and auto-scaling needs):
+# MAGIC Based on dataset size, training time/model complexity, hardware availability and auto-scaling needs, both single and multinode approaches can be considered:
 # MAGIC
 # MAGIC 1. For single node use [Optuna](https://github.com/optuna/optuna) which naitvely supports mlflow callbacks. This approach is recommended if:
 # MAGIC     1. You only have a single/big machine available
 # MAGIC     2. Single training run takes less than 2 seconds (based on dataset size and model architecture)
 # MAGIC 2. For multi-node use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) by leveraging [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html)
-# MAGIC     1. Set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster before starting and attaching the notebook to it
+# MAGIC     1. **VERY IMPORTANT:** If using GPUs set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster
 
 # COMMAND ----------
 
@@ -53,9 +53,9 @@ fe = FeatureEngineeringClient()
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC DROP TABLE IF EXISTS amine_elhelou.ray_gtm_examples.features_synthetic;
-# MAGIC DROP TABLE IF EXISTS amine_elhelou.ray_gtm_examples.labels_synthetic
+# DBTITLE 1,Drop feature tables if they already exist [OPTIONAL]
+spark.sql(f"DROP TABLE IF EXISTS {catalog}.{schema}.{feature_table_name}")
+spark.sql(f"DROP TABLE IF EXISTS {catalog}.{schema}.{labels_table_name}")
 
 # COMMAND ----------
 
@@ -167,7 +167,7 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame):
 
 num_cpu_cores_per_worker = 4 # total cpu to use in each worker node
 max_worker_nodes = 2
-n_trials = 32 # Number of trials (arbitrary for demo purposes but has to be at least > 30 to see benefits of multinode)
+n_trials = 40 # Number of trials (arbitrary for demo purposes but has to be at least > 30 to see benefits of multinode)
 rng_seed = 2025 # Random Number Generation Seed for random states
 
 # COMMAND ----------
@@ -674,7 +674,7 @@ with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id
             reuse_actors = True # Highly recommended for short training jobs (NOT RECOMMENDED FOR GPU AND LONG TRAINING JOBS)
             ),
         run_config=train.RunConfig(
-            name="mlflow",
+            name="ray-tune-optuna",
             callbacks=[
                 MLflowLoggerCallback(
                     experiment_name=experiment_name,
@@ -744,3 +744,7 @@ with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id
 # DBTITLE 1,Elapsed time excluding best model fitting, logging and evaluation
 rt_trials_pdf = multinode_results.get_dataframe()
 print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(rt_trials_pdf['timestamp'].iloc[-1] - rt_trials_pdf['timestamp'].iloc[0] + rt_trials_pdf['time_total_s'].iloc[-1])/60} min")
+
+# COMMAND ----------
+
+
