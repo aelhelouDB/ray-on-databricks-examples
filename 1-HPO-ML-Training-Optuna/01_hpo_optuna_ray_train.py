@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # HPO for traditional ML
+# MAGIC # HPO for traditional ML using Optuna and Ray Tune
 # MAGIC
 # MAGIC In this example we'll cover the new recommended ways for performing distributed hyperparameter optimization on databricks, while also leveraging MLflow for tracking experiments and the feature engineering client to ensure lineage between models and feature tables.
 # MAGIC
@@ -14,12 +14,7 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,Remove this later once ray code freeze is unlocked
-# MAGIC %pip install "ray[default] @ https://ml-team-public-read.s3.us-west-2.amazonaws.com/weichen-temp/ray-3.0.0.dev0-cp311-cp311-linux_x86_64.whl"
-
-# COMMAND ----------
-
-# MAGIC %pip install -qU databricks-feature-engineering optuna optuna-integration mlflow
+# MAGIC %pip install -qU databricks-feature-engineering optuna optuna-integration mlflow ray[default]
 # MAGIC
 # MAGIC
 # MAGIC %restart_python
@@ -37,12 +32,12 @@ primary_key = "id"
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create feature table
+# MAGIC ## 0. Create feature table
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC For this demo/lab we'll be using an augmented version of the [UCI's Adult Census](https://archive.ics.uci.edu/dataset/2/adult) classification dataset
+# MAGIC For this example we'll be using an augmented version of the [UCI's Adult Census](https://archive.ics.uci.edu/dataset/2/adult) classification dataset
 
 # COMMAND ----------
 
@@ -88,7 +83,7 @@ print(f"Created following catalog/schema/tables and variables:\n catalog = {cata
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load training dataset
+# MAGIC ## 1. Load training dataset
 # MAGIC
 # MAGIC First create feature lookups and training dataset specs
 
@@ -124,7 +119,7 @@ X, Y = (training_pdf.drop(label, axis=1), training_pdf[label])
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create Universal preprocessing pipeline
+# MAGIC ## 2. Create Universal preprocessing pipeline
 
 # COMMAND ----------
 
@@ -132,7 +127,7 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
 def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame):
@@ -143,13 +138,15 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame):
   categorical_cols = [col for col in X_train_in if X_train_in[col].dtype == "object"]
   numerical_cols = [col for col in X_train_in if X_train_in[col].dtype != "object"]
   cat_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='most_frequent')),("one_hot_encoder", OneHotEncoder(handle_unknown="ignore"))])
-  num_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='median')), ("scaler", StandardScaler())])                        
+  num_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy='median')), ("scaler", StandardScaler())])
 
   preprocessor = ColumnTransformer(
     transformers=[
       ("cat", cat_pipeline, categorical_cols),
       ("num", num_pipeline, numerical_cols)
-    ]
+    ],
+    remainder="passthrough",
+    sparse_threshold=0
   )
   
   return preprocessor
@@ -157,9 +154,9 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Define high-level experiments parameters
+# MAGIC ## 3. Define high-level experiments parameters
 # MAGIC
-# MAGIC Recommended Cluster Size for lab:
+# MAGIC Recommended Cluster Size for this tutorial:
 # MAGIC * Driver node with 4 cores & min 30GB of RAM
 # MAGIC * 2 worker nodes with 4 cores each & min 30GB of RAM
 
@@ -173,7 +170,7 @@ rng_seed = 2025 # Random Number Generation Seed for random states
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Scaling HPO using Optuna on a single node
+# MAGIC ## 4. Scaling HPO using Optuna on a single node
 # MAGIC Optuna is an advanced hyperparameter optimization framework designed specifically for machine learning tasks. Here are the key ways Optuna conducts hyperparameter optimization:
 # MAGIC
 # MAGIC 1. Define-by-run API: Optuna uses an imperative, define-by-run style API that allows users to dynamically construct the search space for hyperparameters.
@@ -199,7 +196,7 @@ rng_seed = 2025 # Random Number Generation Seed for random states
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Define objective/loss function and search space to optimize
+# MAGIC ### 4a. Define objective/loss function and search space to optimize
 # MAGIC The search space here is defined by calling functions such as `suggest_categorical`, `suggest_float`, `suggest_int` for the Trial object that is passed to the objective function. Optuna allows to define the search space dynamically.
 # MAGIC
 # MAGIC Refer to the documentation for:
@@ -302,7 +299,7 @@ class ObjectiveOptuna(object):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Run on driver node
+# MAGIC ### 4b. Test on driver node
 
 # COMMAND ----------
 
@@ -467,22 +464,24 @@ print(f"Elapsed time for HPO on driver/single node for {n_trials} experiments: {
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Scaling HPO with Ray Tune
+# MAGIC ## 5. Scaling HPO with Ray Tune
 # MAGIC
 # MAGIC Ray Tune allows hyperparameter optimization through several key capabilities:
-# MAGIC 1. Search space definition: defining a search space for hyperparameters using Ray Tune's API, specifying ranges and distributions for parameters to explore.
-# MAGIC 2. Trainable functions: wrapping the model training code in a "trainable" function that Ray Tune can call with different hyperparameter configurations.
-# MAGIC 3. Search algorithms: Ray Tune provides various search algorithms like random search, Bayesian optimization, etc.
-# MAGIC 4. Parallel execution: running multiple trials (hyperparameter configurations) in parallel across a cluster of machines.
-# MAGIC 5. Early stopping: Ray Tune supports early stopping of poorly performing trials to save compute resources
+# MAGIC 1. **Search space definition**: defining a search space for hyperparameters using Ray Tune's API, specifying ranges and distributions for parameters to explore.
+# MAGIC 2. **Trainable functions**: wrapping the model training code in a "trainable" function that Ray Tune can call with different hyperparameter configurations.
+# MAGIC 3. **Search algorithms**: Ray Tune provides search algorithms like grid, random, and Bayesian. Ray Tune also integrates well with other frameworks like Optuna and Hyperopt. 
+# MAGIC 4. **Parallel execution**: running multiple trials (hyperparameter configurations) in parallel across a cluster of machines.
+# MAGIC 5. **Early stopping**: Ray Tune supports early stopping of poorly performing trials to save compute resources
+# MAGIC
+# MAGIC To get started with Ray, we'll set up a Ray cluster and then Ray Tune workflow, encapsulating all the above.
 
 # COMMAND ----------
 
 # DBTITLE 1,Initialize Ray on spark cluster
 import os
 import ray
-from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster, MAX_NUM_WORKER_NODES
 from mlflow.utils.databricks_utils import get_databricks_env_vars
+from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster, MAX_NUM_WORKER_NODES
 
 
 # Cluster cleanup
@@ -538,7 +537,6 @@ os.environ['RAY_ADDRESS'] = ray_conf[0]
 # COMMAND ----------
 
 import pandas as pd
-import mlflow
 import ray
 from lightgbm import LGBMClassifier
 from ray import train
@@ -599,10 +597,13 @@ def objective_ray(config: dict, X_train_in:pd.DataFrame, Y_train_in:pd.Series):
     # Calculate and return F1-Score
     f1_score_binary= f1_score(Y_val, y_val_pred, average="binary", pos_label='>50K')
 
-    # Log
-    train.report({"f1_score_val": f1_score_binary})
+    # Log for ray report/verbose
+    train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
 
 
+# The search space sampling can be defined by 
+# 1) a "define by run function" (see below) which uses Optuna's native sampling OR
+# 2) a dictionary with a different sampling function (i.e. Ray Tune's sampler)
 def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
     """
     Define-by-run function to create the search space.
@@ -631,9 +632,13 @@ def define_by_run_func(trial) -> Optional[Dict[str, Any]]:
 
 # Define Optuna search algo
 searcher = OptunaSearch(space=define_by_run_func, metric="f1_score_val", mode="max")
+# Note: A concurrency limiter, limits the number of parallel trials. This is important for Bayesian search (inherently sequential) as too many parallel trials reduces the benefits of priors to inform the next search round.
 algo = ConcurrencyLimiter(searcher, max_concurrent=num_cpu_cores_per_worker*max_worker_nodes+num_cpus_head_node)
 
 # COMMAND ----------
+
+import mlflow
+
 
 # Grab experiment and model name
 experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
@@ -656,7 +661,7 @@ from mlflow.models import Model
 from mlflow.pyfunc import PyFuncModel
 from mlflow import pyfunc
 from ray import tune
-from ray.air.integrations.mlflow import MLflowLoggerCallback, setup_mlflow
+from ray.air.integrations.mlflow import MLflowLoggerCallback
 
 
 mlflow.set_experiment(experiment_name)
@@ -744,7 +749,3 @@ with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id
 # DBTITLE 1,Elapsed time excluding best model fitting, logging and evaluation
 rt_trials_pdf = multinode_results.get_dataframe()
 print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(rt_trials_pdf['timestamp'].iloc[-1] - rt_trials_pdf['timestamp'].iloc[0] + rt_trials_pdf['time_total_s'].iloc[-1])/60} min")
-
-# COMMAND ----------
-
-
