@@ -6,7 +6,7 @@
 # MAGIC
 # MAGIC We'll use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) on top of [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html) and leverage specific [early stopping](https://docs.ray.io/en/latest/tune/tutorials/tune-stopping.html#early-stopping-with-tune-schedulers) callbacks.
 # MAGIC
-# MAGIC **WORK-IN-PROGRESS**
+# MAGIC **VERY IMPORTANT:** If using GPUs set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster
 
 # COMMAND ----------
 
@@ -27,6 +27,13 @@ primary_key = "id"
 
 # COMMAND ----------
 
+from databricks.feature_engineering import FeatureEngineeringClient
+
+
+fe = FeatureEngineeringClient()
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 0. Create feature table
 # MAGIC _NOTE :_ Only run this section if feature table hasn't been created
@@ -35,13 +42,6 @@ primary_key = "id"
 
 # MAGIC %md
 # MAGIC For this demo/lab we'll be using an augmented version of the [UCI's Adult Census](https://archive.ics.uci.edu/dataset/2/adult) classification dataset
-
-# COMMAND ----------
-
-from databricks.feature_engineering import FeatureEngineeringClient
-
-
-fe = FeatureEngineeringClient()
 
 # COMMAND ----------
 
@@ -163,7 +163,7 @@ def initialize_preprocessing_pipeline(X_train_in:pd.DataFrame, Y_train_in:pd.Ser
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Test pipeline locally _OPTIONAL_
+# MAGIC ## 3. Smoke test _OPTIONAL_
 
 # COMMAND ----------
 
@@ -195,7 +195,7 @@ train_X, val_X, train_y, val_y = train_test_split(X,
                                                       random_state=42)
 
 # Disable mlflow autologging to avoid logging artifacts for every run
-mlflow.sklearn.autolog(disable=True) 
+# mlflow.sklearn.autolog(disable=True)
 
 # Train one XGB model
 xgb_pipeline.fit(train_X, train_y)
@@ -231,12 +231,6 @@ f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
 
 # COMMAND ----------
 
-num_cpu_cores_per_worker = 4 # total cpu to use in each worker node [assumes driver and worker are the same]
-max_worker_nodes = 2
-
-
-# COMMAND ----------
-
 # DBTITLE 1,Initialize Ray on spark cluster
 import os
 import ray
@@ -258,8 +252,8 @@ if restart is True:
     pass
 
 # Set configs based on your cluster size
-num_cpu_cores_per_worker = 16 # total cpu to use in each worker node (total_cores - 1 to leave one core for spark)
-num_cpus_head_node = 8 # Cores to use in driver node (total_cores - 1)
+num_cpu_cores_per_worker = 3 # total cpu to use in each worker node (total_cores - 1 to leave one core for spark)
+num_cpus_head_node = 3 # Cores to use in driver node (total_cores - 1)
 max_worker_nodes = 2
 
 # Set databricks credentials as env vars
@@ -298,6 +292,7 @@ from typing import Dict
 from ray import train, tune
 
 
+metric_name = "f1_score_val"
 rng_seed = 2025 # Random Number Generation Seed for random states
 
 def xgb_ray_trainable(config: Dict, X_train_in:pd.DataFrame, Y_train_in:pd.Series):
@@ -305,8 +300,10 @@ def xgb_ray_trainable(config: Dict, X_train_in:pd.DataFrame, Y_train_in:pd.Serie
     Wrapper training/objective function for ray tune
     """
     
+    # Consider creating/loading X_train/y_train datasets here - TBC ?
+
     # Initialize pipeline
-    ### CHANGE THIS TO USE xgb.train() with `evals' ? #TBC
+    ### CHANGE THIS TO USE xgb.train() with `evals' - TBC ?
     preprocessor, label_encoder = initialize_preprocessing_pipeline(X_train_in, Y_train_in)
     xgb_pipeline = Pipeline(steps=[("preprocessor", preprocessor),
                                    ("classifier", xgb.XGBClassifier(**config))])
@@ -330,17 +327,16 @@ def xgb_ray_trainable(config: Dict, X_train_in:pd.DataFrame, Y_train_in:pd.Serie
     f1_score_binary= f1_score(val_y, y_val_pred, average="binary", pos_label=1)
 
     # Log for ray report/verbose     
-    train.report({"f1_score_val": f1_score_binary}) # [OPTIONAL] to view in ray logs
+    train.report({metric_name: f1_score_binary}) # [OPTIONAL] to view in ray logs
 
-# XGBoost benefits from multi-threading (i.e. leveraging parallel threads to speed up the construction of weak learners). Here you can allocate the number of CPUs to use per XGboost model. We suggest setting this to the number of CPUs equal to or less than the number of CPUs available on the worker (i.e. <12 in this tutorial)
+# XGBoost benefits from multi-threading (i.e. leveraging parallel threads to speed up the construction of weak learners). Here you can allocate the number of CPUs to use per XGboost model. We suggest setting this to the number of CPUs equal to or less than the number of CPUs available on the worker (i.e. <6 in this tutorial)
 trainable_with_resources = tune.with_resources(xgb_ray_trainable, 
-                                               {"CPU": 6})
+                                               {"CPU": 3})
 
 # COMMAND ----------
 
 # DBTITLE 1,Configure your search space and algorithm
 from ray.tune.schedulers import ASHAScheduler
-from ray.tune.search import ConcurrencyLimiter
 
 
 # Define search space as a dictionary with a different sampling function (i.e. Ray Tune's sampler)
@@ -355,8 +351,9 @@ search_space = {
 }
 
 # Enable aggressive early stopping of bad trials
+n_trials = 40
 scheduler = ASHAScheduler(
-    max_t=10, grace_period=1, reduction_factor=2  # 10 training iterations
+    max_t=n_trials, grace_period=1, reduction_factor=2  # 10 training iterations
 )
 
 # COMMAND ----------
@@ -366,15 +363,16 @@ import mlflow
 
 # Grab experiment and model name
 experiment_name = dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+try:
+  experiment_id = mlflow.get_experiment_by_name(experiment_name).experiment_id
+
+except:
+  experiment_id = None
+
 model_name=f"{catalog}.{schema}.hpo_model_ray_tune_xgboost"
 
 # Hold-out Test/Train set
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=rng_seed)
-
-# COMMAND ----------
-
-########################## WORK-IN-PROGRESS
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=rng_seed)
 
 # COMMAND ----------
 
@@ -389,26 +387,27 @@ from ray.air.integrations.mlflow import MLflowLoggerCallback
 
 
 mlflow.set_experiment(experiment_name)
-n_trials = 40
-
-with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id=experiment_id) as parent_run:
+with mlflow.start_run(run_name ='ray_tune_xgboost', experiment_id=experiment_id) as parent_run:
     # Run our Tuner job
     tuner = tune.Tuner(
         ray.tune.with_parameters(
             trainable_with_resources,
-            X_train_in = X_train, Y_train_in = Y_train),
+            X_train_in = X_train, Y_train_in = y_train),
         tune_config=tune.TuneConfig(
             scheduler=scheduler,
             num_samples=n_trials,
+            metric=metric_name,
+            mode="max", # "min"
             reuse_actors = True # Highly recommended for short training jobs (NOT RECOMMENDED FOR GPU AND LONG TRAINING JOBS)
-            )
+            ),
+        param_space=search_space,
     )
 
     xgb_results = tuner.fit()
 
     # Extract best trial info
-    best_model_params = xgb_results.get_best_result(metric="f1_score_val",
-                                                           mode="max",
+    best_model_params = xgb_results.get_best_result(metric=metric_name,
+                                                        mode="max",
                                                             scope='last').config
     best_model_params["random_state"] = rng_seed
     
@@ -422,25 +421,17 @@ with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id
     
     # Fit best model and log using FE client in parent run.
     # Note that since this is our final model, we will train using all the data
-    preprocessor, label_encoder = initialize_preprocessing_pipeline(X, y)
+    preprocessor, label_encoder = initialize_preprocessing_pipeline(X_train, y_train)
     model_pipeline = Pipeline(steps=[("preprocessor", preprocessor),
                                       ("classifier", best_model)])
-    model_pipeline.fit(X, y)
-
-    # Infer output schema
-    try:
-        output_schema = _infer_schema(y)
-    
-    except Exception as e:
-        warnings.warn(f"Could not infer model output schema: {e}")
-        output_schema = None
+    y_train_encoded = label_encoder.transform(y_train)
+    model_pipeline.fit(X_train, y_train_encoded)
     
     fe.log_model(
         model=model_pipeline,
         artifact_path="model",
         flavor=mlflow.sklearn,
         training_set=training_set,
-        output_schema=output_schema,
         registered_model_name=model_name
     )
 
@@ -452,27 +443,32 @@ with mlflow.start_run(run_name ='ray_tune_native_mlflow_callback', experiment_id
     # Log metrics for the training set
     training_eval_result = mlflow.evaluate(
         model=pyfunc_model,
-        data=X.assign(**{str(label):y}),
+        data=X_train.assign(**{str(label):y_train_encoded}),
         targets=label,
         model_type="classifier",
         evaluator_config = {"log_model_explainability": False,
                             "metric_prefix": "training_" , "pos_label": 1}
     )
 
-    # # Log metrics for the test set
-    # val_eval_result = mlflow.evaluate(
-    #     model=pyfunc_model,
-    #     data=X_test.assign(**{str(label):Y_test}),
-    #     targets=label,
-    #     model_type="classifier",
-    #     evaluator_config = {"log_model_explainability": False,
-    #                         "metric_prefix": "test_" , "pos_label": ">50K" }
-    # )
+    # Log metrics for the test set
+    y_test_encoded = label_encoder.transform(y_test)
+    val_eval_result = mlflow.evaluate(
+        model=pyfunc_model,
+        data=X_test.assign(**{str(label):y_test_encoded}),
+        targets=label,
+        model_type="classifier",
+        evaluator_config = {"log_model_explainability": False,
+                            "metric_prefix": "test_" , "pos_label": 1 }
+    )
 
     mlflow.end_run()
 
 # COMMAND ----------
 
 # DBTITLE 1,Elapsed time excluding best model fitting, logging and evaluation
-rt_trials_pdf = multinode_results.get_dataframe()
-print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(rt_trials_pdf['timestamp'].iloc[-1] - rt_trials_pdf['timestamp'].iloc[0] + rt_trials_pdf['time_total_s'].iloc[-1])/60} min")
+xgb_trials_pdf = xgb_results.get_dataframe()
+print(f"Elapsed time for multinode HPO with ray tune for {n_trials} experiments:: {(xgb_trials_pdf['timestamp'].iloc[-1] - xgb_trials_pdf['timestamp'].iloc[0] + xgb_trials_pdf['time_total_s'].iloc[-1])/60} min")
+
+# COMMAND ----------
+
+
