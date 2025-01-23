@@ -1,30 +1,40 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Ray On Spark for multimodal image batch inference
+# MAGIC In this example we'll cover how to perform distributed batch inference on databricks clusters for Small/Medium Multimodal Language Models (i.e. SLM), while also leveraging MLflow for model versionning and logging.
+# MAGIC
+# MAGIC
 # MAGIC **Pre-Requisites:**
 # MAGIC - Set this spark config at the cluster level: `spark.task.resource.gpu.amount 0` before starting the cluster
 # MAGIC
-# MAGIC
+# MAGIC Tested on:
+# MAGIC ```
+# MAGIC Databricks Machine Learning Runtime 15.4LTS
+# MAGIC mlflow=2.19.0
+# MAGIC ray==2.40.0
+# MAGIC ```
 # MAGIC **WORK-IN-PROGRESS**
 
 # COMMAND ----------
 
-# DBTITLE 1,Install Model Dependencies
-# MAGIC %pip install timm
+# MAGIC %pip install -qU ray[default] ray[data] timm
+# MAGIC
+# MAGIC
+# MAGIC %restart_python
 
 # COMMAND ----------
 
-# MAGIC %pip install -U ray[default]>=2.3.0, ray[data]
-# MAGIC
-# MAGIC
-# MAGIC dbutils.library.restartPython()
+# DBTITLE 1,Define catalog/schema/volumes
+catalog = "amine_elhelou" # Change This/Point to an existing catalog
+schema = "ray_gtm_examples" # Point to an existing schema
+volume = "fashion-images"
 
 # COMMAND ----------
 
-# DBTITLE 1,Create widgets for catalog/schema/volumes
-dbutils.widgets.text("catalog","amine_elhelou","CATALOG")
-dbutils.widgets.text("schema","ttd_ray_test","SCHEMA")
-dbutils.widgets.text("volume","fashion-images","VOLUME")
+# MAGIC %sql
+# MAGIC CREATE WIDGET TEXT catalog DEFAULT 'amine_elhelou';
+# MAGIC CREATE WIDGET TEXT schema DEFAULT 'ray_gtm_examples';
+# MAGIC CREATE WIDGET TEXT volume DEFAULT 'fashion-images';
 
 # COMMAND ----------
 
@@ -32,13 +42,7 @@ dbutils.widgets.text("volume","fashion-images","VOLUME")
 # MAGIC ## 0. Image data setup
 # MAGIC 1. Create Volume (see section below)
 # MAGIC 2. Manually download kaggle fashion image [dataset](https://www.kaggle.com/datasets/vikashrajluhaniwal/fashion-images/data)
-# MAGIC 3. Upload the zipped data set in UC volumes (e.g.`/Volumes/amine_elhelou/ttd_ray_test/fashion-images`)
-
-# COMMAND ----------
-
-catalog = dbutils.widgets.get("catalog")
-schema = dbutils.widgets.get("schema")
-volume = dbutils.widgets.get("volume")
+# MAGIC 3. Upload the zipped data set in UC volumes (e.g.`/Volumes/amine_elhelou/ray_gtm_examples/fashion-images`)
 
 # COMMAND ----------
 
@@ -50,14 +54,36 @@ volume = dbutils.widgets.get("volume")
 
 # COMMAND ----------
 
-# DBTITLE 1,Unzip files anc copy back to volume
+# MAGIC %md
+# MAGIC ### Move images to Volume
+
+# COMMAND ----------
+
+# DBTITLE 1,If downloading dataset here
+# MAGIC %sh
+# MAGIC curl -L -o ./fashion-images.zip \
+# MAGIC   https://www.kaggle.com/api/v1/datasets/download/vikashrajluhaniwal/fashion-images
+# MAGIC unzip fashion-images.zip
+# MAGIC cp -R ~/data/* /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/data/
+# MAGIC rm -rf data
+# MAGIC rm fashion-images.zip
+
+# COMMAND ----------
+
+# MAGIC %sh
+# MAGIC rm -rf data
+# MAGIC rm fashion-images.zip
+
+# COMMAND ----------
+
+# DBTITLE 1,If dataset has been uploaded manually
 # MAGIC %sh
 # MAGIC cd ~
 # MAGIC rm -rf data
-# MAGIC cp /Volumes/amine_elhelou/ttd_ray_test/fashion-images/archive.zip ./
+# MAGIC cp /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/archive.zip ./
 # MAGIC unzip archive.zip
 # MAGIC mkdir /Volumes/amine_elhelou/ttd_ray_test/fashion-images/data
-# MAGIC cp -R ~/data/* /Volumes/amine_elhelou/ttd_ray_test/fashion-images/data/
+# MAGIC cp -R ~/data/* /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/data/
 
 # COMMAND ----------
 
@@ -69,9 +95,13 @@ display(folder_paths)
 # COMMAND ----------
 
 # DBTITLE 1,Set images folder/volumes paths
-# TODO: Replace with your own image paths (can be multiple local or S3 paths)
 image_paths = ["Apparel/Boys/Images/images_with_product_ids/", "Apparel/Girls/Images/images_with_product_ids/",
                "Footwear/Men/Images/images_with_product_ids/", "Footwear/Women/Images/images_with_product_ids/"]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Read images as bytestream into a Delta Table
 
 # COMMAND ----------
 
@@ -94,21 +124,15 @@ data_bin_df = spark.createDataFrame([], schema=raw_binary_images_schema)
 for path in image_paths:
   data_bin_df = data_bin_df.unionAll(spark.read.format("binaryFile").load(f"{volume_path}/{path}"))
 
-
 # Materialze
-data_bin_df.write.format("delta").mode("append").saveAsTable(f"{catalog}.{schema}.raw_binary_data")
+data_bin_df.write.mode("overwrite").saveAsTable(f"{catalog}.{schema}.bronze_binary_images")
 
-# NOTE: In future this can be turned into a streaming ingestion job using autoloader
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT * FROM ${catalog}.${schema}.raw_binary_data LIMIT 10
+# NOTE: If images are streamed/dumped to Cloud Storage, this can be turned into a streaming ingestion job using autoloader
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SELECT COUNT(*) FROM ${catalog}.${schema}.raw_binary_data
+# MAGIC SELECT * FROM ${catalog}.${schema}.bronze_binary_images LIMIT 10
 
 # COMMAND ----------
 
@@ -230,17 +254,31 @@ class MiniInternVLimagePreprocessor():
 
 # COMMAND ----------
 
-# DBTITLE 1,Wrap LLM multimodal inference in ray-friendly class
+# DBTITLE 1,Task2: Download model from hugging face and snap weights to mlflow
 import transformers
 from transformers import AutoTokenizer, AutoModel
+
+
+hf_model_path = "OpenGVLab/Mini-InternVL-Chat-2B-V1-5"
+hf_model = AutoModel.from_pretrained(hf_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
+
+# COMMAND ----------
+
+import mlflow
+
+
+#TO-DO: Log model to mlflow
+
+# COMMAND ----------
+
+# DBTITLE 1,Wrap LLM multimodal inference in ray-friendly class
 from typing import Dict
 
-# test_prompt = '1. Identify the language in the text of this image and limit the result into one word. 2. Detect all text in this image and combine result into paragraph. Format them into a list. 3. Describe the scene and objects in this image in one sentence. An example output: 1. English. 2. ["xxx", ...] 3. This image describes ...'
 
 test_prompt = "What do you see in the image?"
-model_hf_path = "OpenGVLab/Mini-InternVL-Chat-2B-V1-5"
 
-    
+
 class MMAnalysis_batch:
     """
     Wrapper class to perform batch multimodal model inference on prepared pixel values (formatted as numpy array)

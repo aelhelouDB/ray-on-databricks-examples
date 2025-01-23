@@ -7,6 +7,14 @@
 # MAGIC We'll use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) on top of [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html) and leverage specific [early stopping](https://docs.ray.io/en/latest/tune/tutorials/tune-stopping.html#early-stopping-with-tune-schedulers) callbacks.
 # MAGIC
 # MAGIC **VERY IMPORTANT:** If using GPUs set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster
+# MAGIC
+# MAGIC Tested on:
+# MAGIC ```
+# MAGIC Databricks Machine Learning Runtime 15.4LTS
+# MAGIC databricks-feature-engineering-client==0.8.0
+# MAGIC mlflow=2.19.0
+# MAGIC ray==2.40.0
+# MAGIC ```
 
 # COMMAND ----------
 
@@ -17,7 +25,7 @@
 
 # COMMAND ----------
 
-catalog = "amine_elhelou" # Change This
+catalog = "amine_elhelou" # Change This/Point to an existing catalog
 schema = "ray_gtm_examples"
 table = "adult_synthetic_raw"
 feature_table_name = "features_synthetic"

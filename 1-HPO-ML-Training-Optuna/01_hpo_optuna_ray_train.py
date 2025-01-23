@@ -10,7 +10,17 @@
 # MAGIC     1. You only have a single/big machine available
 # MAGIC     2. Single training run takes less than 2 seconds (based on dataset size and model architecture)
 # MAGIC 2. For multi-node use [Ray Tune](https://docs.ray.io/en/latest/tune/index.html) by leveraging [ray on spark](https://docs.databricks.com/en/machine-learning/ray/index.html)
-# MAGIC     1. **VERY IMPORTANT:** If using GPUs set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster
+# MAGIC
+# MAGIC
+# MAGIC **VERY IMPORTANT:** If using GPUs set the `spark.task.resource.gpu.amount 0` spark config on your (multinode) cluster.
+# MAGIC
+# MAGIC Tested on:
+# MAGIC ```
+# MAGIC Databricks Machine Learning Runtime 15.4LTS
+# MAGIC databricks-feature-engineering-client==0.8.0
+# MAGIC mlflow=2.19.0
+# MAGIC ray==2.40.0
+# MAGIC ```
 
 # COMMAND ----------
 
