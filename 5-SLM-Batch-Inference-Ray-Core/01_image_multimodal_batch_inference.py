@@ -70,12 +70,6 @@ volume = "fashion-images"
 
 # COMMAND ----------
 
-# MAGIC %sh
-# MAGIC rm -rf data
-# MAGIC rm fashion-images.zip
-
-# COMMAND ----------
-
 # DBTITLE 1,If dataset has been uploaded manually
 # MAGIC %sh
 # MAGIC cd ~
@@ -268,7 +262,12 @@ tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
 import mlflow
 
 
-#TO-DO: Log model to mlflow
+with mlflow.start_run(run_name="Model Weights Snapping") as run:
+
+  mlflow.transformers.log_model(
+    transformers_model = hf_model,
+    artifact_path = "hf_model",
+  )
 
 # COMMAND ----------
 
@@ -284,7 +283,7 @@ class MMAnalysis_batch:
     Wrapper class to perform batch multimodal model inference on prepared pixel values (formatted as numpy array)
     """
 
-    def __init__(self, model_path:str = model_hf_path, prompt: str=test_prompt):
+    def __init__(self, model_path:str = hf_model_path, prompt: str=test_prompt):
         self.path = model_path
         self.model = AutoModel.from_pretrained(self.path,
                                                torch_dtype=torch.bfloat16,
