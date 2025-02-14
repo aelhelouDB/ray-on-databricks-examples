@@ -11,9 +11,10 @@
 # MAGIC ```
 # MAGIC Databricks Machine Learning Runtime 15.4LTS
 # MAGIC mlflow=2.19.0
-# MAGIC ray==2.40.0
+# MAGIC ray==2.40.2
 # MAGIC ```
-# MAGIC **WORK-IN-PROGRESS**
+# MAGIC **WORK-IN-PROGRESS/TO-DO:**
+# MAGIC - Switch from `Mini-Intern-VL` to `Qwen` and log/snap model and load back from mlflow/UC Registry
 
 # COMMAND ----------
 
@@ -253,7 +254,7 @@ import transformers
 from transformers import AutoTokenizer, AutoModel
 
 
-hf_model_path = "OpenGVLab/Mini-InternVL-Chat-2B-V1-5"
+hf_model_path = "OpenGVLab/InternVL2_5-4B" # OpenGVLab/Mini-InternVL-Chat-2B-V1-5"
 hf_model = AutoModel.from_pretrained(hf_model_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
 
