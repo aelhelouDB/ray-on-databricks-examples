@@ -1,4 +1,5 @@
 # Examples
+**DEPRECATED - PLEASE USE [THIS REPO](https://github.com/databricks-industry-solutions/ray-framework-on-databricks) INSTEAD**
 1. Hyper-Parameter-Optimization(HPO) using Optuna & Ray Tune (& MLflow)
 2. Hyper-Parameter-Optimization(HPO) for XGBoost model using Ray Tune (& MLflow)
 3. Hyper-Parameter-Optimization(HPO) for Deep-Learning/Vision model (& MLflow)
