@@ -39,53 +39,11 @@ volume = "fashion-images"
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 0. Image data setup
-# MAGIC 1. Create Volume (see section below)
-# MAGIC 2. Manually download kaggle fashion image [dataset](https://www.kaggle.com/datasets/vikashrajluhaniwal/fashion-images/data)
-# MAGIC 3. Upload the zipped data set in UC volumes (e.g.`/Volumes/amine_elhelou/ray_gtm_examples/fashion-images`)
-
-# COMMAND ----------
-
 # DBTITLE 1,Create/Set catalog, schema and volume
 # MAGIC %sql
 # MAGIC USE CATALOG ${catalog};
 # MAGIC USE SCHEMA ${schema};
 # MAGIC CREATE VOLUME IF NOT EXISTS `${volume}`
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Move images to Volume
-
-# COMMAND ----------
-
-# DBTITLE 1,If downloading dataset here
-# MAGIC %sh
-# MAGIC curl -L -o ./fashion-images.zip \
-# MAGIC   https://www.kaggle.com/api/v1/datasets/download/vikashrajluhaniwal/fashion-images
-# MAGIC unzip fashion-images.zip
-# MAGIC cp -R ~/data/* /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/data/
-# MAGIC rm -rf data
-# MAGIC rm fashion-images.zip
-
-# COMMAND ----------
-
-# DBTITLE 1,If dataset has been uploaded manually
-# MAGIC %sh
-# MAGIC cd ~
-# MAGIC rm -rf data
-# MAGIC cp /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/archive.zip ./
-# MAGIC unzip archive.zip
-# MAGIC mkdir /Volumes/amine_elhelou/ttd_ray_test/fashion-images/data
-# MAGIC cp -R ~/data/* /Volumes/amine_elhelou/ray_gtm_examples/fashion-images/data/
-
-# COMMAND ----------
-
-# DBTITLE 1,Sanity-Check that files have been copied
-volume_path = f"/Volumes/{catalog}/{schema}/{volume}/data/"
-folder_paths = dbutils.fs.ls(volume_path)
-display(folder_paths)
 
 # COMMAND ----------
 
